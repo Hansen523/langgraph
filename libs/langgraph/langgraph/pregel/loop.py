@@ -1,5 +1,7 @@
 import asyncio
+import binascii
 import concurrent.futures
+import dataclasses
 from collections import defaultdict, deque
 from contextlib import AsyncExitStack, ExitStack
 from inspect import signature
@@ -79,6 +81,7 @@ from langgraph.pregel.algo import (
     GetNextVersion,
     PregelTaskWrites,
     apply_writes,
+    checkpoint_null_version,
     increment,
     prepare_next_tasks,
     prepare_single_task,
@@ -207,6 +210,7 @@ class PregelLoop(LoopProtocol):
         manager: Union[None, AsyncParentRunManager, ParentRunManager] = None,
         input_model: Optional[Type[BaseModel]] = None,
         debug: bool = False,
+        trigger_to_nodes: Optional[Mapping[str, list[str]]] = None,
     ) -> None:
         super().__init__(
             step=0,
@@ -230,6 +234,7 @@ class PregelLoop(LoopProtocol):
             CONFIG_KEY_CHECKPOINT_ID not in config[CONF]
             or CONFIG_KEY_DEDUPE_TASKS in config[CONF]
         )
+        self.trigger_to_nodes = trigger_to_nodes
         self.debug = debug
         if self.stream is not None and CONFIG_KEY_STREAM in config[CONF]:
             self.stream = DuplexStream(self.stream, config[CONF][CONFIG_KEY_STREAM])
@@ -347,12 +352,16 @@ class PregelLoop(LoopProtocol):
         ):
             self.to_interrupt.append(task)
             return
+        checkpoint_id_bytes = binascii.unhexlify(self.checkpoint["id"].replace("-", ""))
+        null_version = checkpoint_null_version(self.checkpoint)
         if pushed := cast(
             Optional[PregelExecutableTask],
             prepare_single_task(
                 (PUSH, task.path, write_idx, task.id, call),
                 None,
                 checkpoint=self.checkpoint,
+                checkpoint_id_bytes=checkpoint_id_bytes,
+                checkpoint_null_version=null_version,
                 pending_writes=self.checkpoint_pending_writes,
                 processes=self.nodes,
                 channels=self.channels,
@@ -400,6 +409,8 @@ class PregelLoop(LoopProtocol):
         if self.status != "pending":
             raise RuntimeError("Cannot tick when status is no longer 'pending'")
 
+        updated_channels: set[str] | None = None
+
         if self.input not in (INPUT_DONE, INPUT_RESUMING, INPUT_SHOULD_VALIDATE):
             self._first(input_keys=input_keys)
         elif self.to_interrupt:
@@ -421,7 +432,7 @@ class PregelLoop(LoopProtocol):
                     ),
                 )
             # all tasks have finished
-            mv_writes = apply_writes(
+            mv_writes, updated_channels = apply_writes(
                 self.checkpoint,
                 self.channels,
                 self.tasks.values(),
@@ -487,6 +498,8 @@ class PregelLoop(LoopProtocol):
             manager=self.manager,
             store=self.store,
             checkpointer=self.checkpointer,
+            trigger_to_nodes=self.trigger_to_nodes,
+            updated_channels=updated_channels,
         )
         self.to_interrupt = []
 
@@ -565,7 +578,7 @@ class PregelLoop(LoopProtocol):
                         self.checkpoint["versions_seen"].get(INTERRUPT, {}).values(),
                         default=None,
                     ):
-                        self.tasks[tid] = task._replace(scheduled=True)
+                        self.tasks[tid] = dataclasses.replace(task, scheduled=True)
                 else:
                     task.writes.append((k, v))
 
@@ -587,15 +600,6 @@ class PregelLoop(LoopProtocol):
             )
         )
 
-        # take resume value from parent
-        if scratchpad := cast(
-            Optional[PregelScratchpad], configurable.get(CONFIG_KEY_SCRATCHPAD)
-        ):
-            if (
-                isinstance(scratchpad, PregelScratchpad)
-                and scratchpad.null_resume is not None
-            ):
-                self.put_writes(NULL_TASK_ID, [(RESUME, scratchpad.null_resume)])
         # map command to writes
         if isinstance(self.input, Command):
             if self.input.resume is not None and not self.checkpointer:
@@ -615,7 +619,7 @@ class PregelLoop(LoopProtocol):
         if null_writes := [
             w[1:] for w in self.checkpoint_pending_writes if w[0] == NULL_TASK_ID
         ]:
-            mv_writes = apply_writes(
+            mv_writes, _ = apply_writes(
                 self.checkpoint,
                 self.channels,
                 [PregelTaskWrites((), INPUT, null_writes, [])],
@@ -664,7 +668,7 @@ class PregelLoop(LoopProtocol):
                 manager=None,
             )
             # apply input writes
-            mv_writes = apply_writes(
+            mv_writes, _ = apply_writes(
                 self.checkpoint,
                 self.channels,
                 [
@@ -779,7 +783,7 @@ class PregelLoop(LoopProtocol):
                 and self.checkpoint_pending_writes
                 and any(task.writes for task in self.tasks.values())
             ):
-                mv_writes = apply_writes(
+                mv_writes, _ = apply_writes(
                     self.checkpoint,
                     self.channels,
                     self.tasks.values(),
@@ -794,11 +798,14 @@ class PregelLoop(LoopProtocol):
                     [w for t in self.tasks.values() for w in t.writes],
                     self.channels,
                 )
-            # emit INTERRUPT event
-            self._emit(
-                "updates",
-                lambda: iter([{INTERRUPT: cast(GraphInterrupt, exc_value).args[0]}]),
-            )
+            # emit INTERRUPT if exception is empty (otherwise emitted by put_writes)
+            if exc_value is not None and (not exc_value.args or not exc_value.args[0]):
+                self._emit(
+                    "updates",
+                    lambda: iter(
+                        [{INTERRUPT: cast(GraphInterrupt, exc_value).args[0]}]
+                    ),
+                )
             # save final output
             self.output = read_channels(self.channels, self.output_keys)
             # suppress interrupt
@@ -829,7 +836,25 @@ class PregelLoop(LoopProtocol):
                 "tags", EMPTY_SEQ
             ):
                 return
-            if writes[0][0] != ERROR and writes[0][0] != INTERRUPT:
+            if writes[0][0] == INTERRUPT:
+                self._emit(
+                    "updates",
+                    lambda: iter(
+                        [
+                            {
+                                INTERRUPT: tuple(
+                                    v
+                                    for w in writes
+                                    if w[0] == INTERRUPT
+                                    for v in (
+                                        w[1] if isinstance(w[1], Sequence) else (w[1],)
+                                    )
+                                )
+                            }
+                        ]
+                    ),
+                )
+            elif writes[0][0] != ERROR:
                 self._emit(
                     "updates",
                     map_output_updates,
@@ -865,6 +890,7 @@ class SyncPregelLoop(PregelLoop, ContextManager):
         stream_keys: Union[str, Sequence[str]] = EMPTY_SEQ,
         input_model: Optional[Type[BaseModel]] = None,
         debug: bool = False,
+        trigger_to_nodes: Optional[Mapping[str, list[str]]] = None,
     ) -> None:
         super().__init__(
             input,
@@ -881,6 +907,7 @@ class SyncPregelLoop(PregelLoop, ContextManager):
             interrupt_before=interrupt_before,
             manager=manager,
             debug=debug,
+            trigger_to_nodes=trigger_to_nodes,
         )
         self.stack = ExitStack()
         if checkpointer:
@@ -1006,6 +1033,7 @@ class AsyncPregelLoop(PregelLoop, AsyncContextManager):
         stream_keys: Union[str, Sequence[str]] = EMPTY_SEQ,
         input_model: Optional[Type[BaseModel]] = None,
         debug: bool = False,
+        trigger_to_nodes: Optional[Mapping[str, list[str]]] = None,
     ) -> None:
         super().__init__(
             input,
@@ -1022,6 +1050,7 @@ class AsyncPregelLoop(PregelLoop, AsyncContextManager):
             interrupt_before=interrupt_before,
             manager=manager,
             debug=debug,
+            trigger_to_nodes=trigger_to_nodes,
         )
         self.stack = AsyncExitStack()
         if checkpointer:

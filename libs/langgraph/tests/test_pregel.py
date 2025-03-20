@@ -1,5 +1,6 @@
 import enum
 import functools
+import gc
 import json
 import logging
 import operator
@@ -62,13 +63,16 @@ from langgraph.graph import END, Graph, StateGraph
 from langgraph.graph.message import MessageGraph, MessagesState, add_messages
 from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.pregel import Channel, GraphRecursionError, Pregel, StateSnapshot
+from langgraph.pregel.loop import SyncPregelLoop
 from langgraph.pregel.retry import RetryPolicy
+from langgraph.pregel.runner import PregelRunner
 from langgraph.store.base import BaseStore
 from langgraph.types import (
     Command,
     Interrupt,
     PregelTask,
     Send,
+    StateUpdate,
     StreamWriter,
     interrupt,
 )
@@ -817,7 +821,7 @@ def test_invoke_two_processes_in_dict_out(mocker: MockerFixture) -> None:
                 "id": AnyStr(),
                 "name": "one",
                 "input": 2,
-                "triggers": ["input"],
+                "triggers": ("input",),
             },
         },
         {
@@ -828,7 +832,7 @@ def test_invoke_two_processes_in_dict_out(mocker: MockerFixture) -> None:
                 "id": AnyStr(),
                 "name": "two",
                 "input": [12],
-                "triggers": ["inbox"],
+                "triggers": ("inbox",),
             },
         },
         {
@@ -863,7 +867,7 @@ def test_invoke_two_processes_in_dict_out(mocker: MockerFixture) -> None:
                 "id": AnyStr(),
                 "name": "two",
                 "input": [3],
-                "triggers": ["inbox"],
+                "triggers": ("inbox",),
             },
         },
         {
@@ -3247,14 +3251,24 @@ def test_in_one_fan_out_state_graph_waiting_edge_plus_regular(
 
     assert [
         c for c in app_w_interrupt.stream({"query": "what is weather in sf"}, config)
-    ] == [
-        {"rewrite_query": {"query": "query: what is weather in sf"}},
-        {"qa": {"answer": ""}},
-        {"analyzer_one": {"query": "analyzed: query: what is weather in sf"}},
-        {"retriever_two": {"docs": ["doc3", "doc4"]}},
-        {"retriever_one": {"docs": ["doc1", "doc2"]}},
-        {"__interrupt__": ()},
-    ]
+    ] in (
+        [
+            {"rewrite_query": {"query": "query: what is weather in sf"}},
+            {"qa": {"answer": ""}},
+            {"analyzer_one": {"query": "analyzed: query: what is weather in sf"}},
+            {"retriever_two": {"docs": ["doc3", "doc4"]}},
+            {"retriever_one": {"docs": ["doc1", "doc2"]}},
+            {"__interrupt__": ()},
+        ],
+        [
+            {"rewrite_query": {"query": "query: what is weather in sf"}},
+            {"analyzer_one": {"query": "analyzed: query: what is weather in sf"}},
+            {"qa": {"answer": ""}},
+            {"retriever_two": {"docs": ["doc3", "doc4"]}},
+            {"retriever_one": {"docs": ["doc1", "doc2"]}},
+            {"__interrupt__": ()},
+        ],
+    )
 
     assert [c for c in app_w_interrupt.stream(None, config)] == [
         {"qa": {"answer": "doc1,doc2,doc3,doc4"}},
@@ -5969,9 +5983,7 @@ def test_falsy_return_from_task(
                     "a": 5,
                 },
                 "name": "graph",
-                "triggers": [
-                    "__start__",
-                ],
+                "triggers": ("__start__",),
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -5985,9 +5997,7 @@ def test_falsy_return_from_task(
                     {},
                 ),
                 "name": "falsy_task",
-                "triggers": [
-                    "__pregel_push",
-                ],
+                "triggers": ("__pregel_push",),
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -6094,9 +6104,7 @@ def test_falsy_return_from_task(
                     "a": 5,
                 },
                 "name": "graph",
-                "triggers": [
-                    "__start__",
-                ],
+                "triggers": ("__start__",),
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -6110,9 +6118,7 @@ def test_falsy_return_from_task(
                     {},
                 ),
                 "name": "falsy_task",
-                "triggers": [
-                    "__pregel_push",
-                ],
+                "triggers": ("__pregel_push",),
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -6923,7 +6929,10 @@ def test_tags_stream_mode_messages() -> None:
             {
                 "langgraph_step": 1,
                 "langgraph_node": "call_model",
-                "langgraph_triggers": ["start:call_model"],
+                "langgraph_triggers": (
+                    "branch:to:call_model",
+                    "start:call_model",
+                ),
                 "langgraph_path": ("__pregel_pull", "call_model"),
                 "langgraph_checkpoint_ns": AnyStr("call_model:"),
                 "checkpoint_ns": AnyStr("call_model:"),
@@ -7317,3 +7326,614 @@ def test_empty_invoke() -> None:
         "111": 111,
         "222": 222,
     }
+
+
+@pytest.mark.parametrize("checkpointer_name", ALL_CHECKPOINTERS_SYNC)
+def test_parallel_interrupts(
+    request: pytest.FixtureRequest, checkpointer_name: str
+) -> None:
+    from pydantic import BaseModel, Field
+
+    checkpointer = request.getfixturevalue(f"checkpointer_{checkpointer_name}")
+
+    # --- CHILD GRAPH ---
+
+    class ChildState(BaseModel):
+        prompt: str = Field(..., description="What is going to be asked to the user?")
+        human_input: Optional[str] = Field(None, description="What the human said")
+        human_inputs: Annotated[List[str], operator.add] = Field(
+            default_factory=list, description="All of my messages"
+        )
+
+    def get_human_input(state: ChildState):
+        human_input = interrupt(state.prompt)
+
+        return dict(
+            human_input=human_input,  # update child state
+            human_inputs=[human_input],  # update parent state
+        )
+
+    child_graph_builder = StateGraph(ChildState)
+    child_graph_builder.add_node("get_human_input", get_human_input)
+    child_graph_builder.add_edge(START, "get_human_input")
+    child_graph_builder.add_edge("get_human_input", END)
+    child_graph = child_graph_builder.compile()
+
+    # --- PARENT GRAPH ---
+
+    class ParentState(BaseModel):
+        prompts: List[str] = Field(
+            ..., description="What is going to be asked to the user?"
+        )
+        human_inputs: Annotated[List[str], operator.add] = Field(
+            default_factory=list, description="All of my messages"
+        )
+
+    def assign_workers(state: ParentState):
+        return [
+            Send(
+                "child_graph",
+                dict(
+                    prompt=prompt,
+                ),
+            )
+            for prompt in state.prompts
+        ]
+
+    def cleanup(state: ParentState):
+        assert len(state.human_inputs) == len(state.prompts)
+
+    parent_graph_builder = StateGraph(ParentState)
+    parent_graph_builder.add_node("child_graph", child_graph)
+    parent_graph_builder.add_node("cleanup", cleanup)
+
+    parent_graph_builder.add_conditional_edges(START, assign_workers, ["child_graph"])
+    parent_graph_builder.add_edge("child_graph", "cleanup")
+    parent_graph_builder.add_edge("cleanup", END)
+
+    parent_graph = parent_graph_builder.compile(checkpointer=checkpointer)
+
+    # --- CLIENT INVOCATION ---
+
+    thread_config = dict(
+        configurable=dict(
+            thread_id=str(uuid.uuid4()),
+        )
+    )
+    current_input = dict(
+        prompts=["a", "b"],
+    )
+
+    invokes = 0
+    events: dict[int, list[dict]] = {}
+    while invokes < 10:
+        # reset interrupt
+        invokes += 1
+        events[invokes] = []
+        current_interrupts: list[Interrupt] = []
+
+        # start / resume the graph
+        for event in parent_graph.stream(
+            input=current_input,
+            config=thread_config,
+            stream_mode="updates",
+        ):
+            events[invokes].append(event)
+            # handle the interrupt
+            if "__interrupt__" in event:
+                current_interrupts.extend(event["__interrupt__"])
+                # assume that it breaks here, because it is an interrupt
+
+        # get human input and resume
+        if any(i.resumable for i in current_interrupts):
+            current_input = Command(resume=f"Resume #{invokes}")
+
+        # not more human input required, must be completed
+        else:
+            break
+    else:
+        assert False, "Detected infinite loop"
+
+    assert invokes == 3
+    assert len(events) == 3
+
+    assert events[1] == UnsortedSequence(
+        {
+            "__interrupt__": (
+                Interrupt(
+                    value="a",
+                    resumable=True,
+                    ns=[
+                        AnyStr("child_graph:"),
+                        AnyStr("get_human_input:"),
+                    ],
+                ),
+            )
+        },
+        {
+            "__interrupt__": (
+                Interrupt(
+                    value="b",
+                    resumable=True,
+                    ns=[
+                        AnyStr("child_graph:"),
+                        AnyStr("get_human_input:"),
+                    ],
+                ),
+            )
+        },
+    )
+    assert events[2] in (
+        UnsortedSequence(
+            {
+                "__interrupt__": (
+                    Interrupt(
+                        value="a",
+                        resumable=True,
+                        ns=[
+                            AnyStr("child_graph:"),
+                            AnyStr("get_human_input:"),
+                        ],
+                    ),
+                )
+            },
+            {"child_graph": {"human_inputs": ["Resume #1"]}},
+        ),
+        UnsortedSequence(
+            {
+                "__interrupt__": (
+                    Interrupt(
+                        value="b",
+                        resumable=True,
+                        ns=[
+                            AnyStr("child_graph:"),
+                            AnyStr("get_human_input:"),
+                        ],
+                    ),
+                )
+            },
+            {"child_graph": {"human_inputs": ["Resume #1"]}},
+        ),
+    )
+    assert events[3] == UnsortedSequence(
+        {
+            "child_graph": {"human_inputs": ["Resume #1"]},
+            "__metadata__": {"cached": True},
+        },
+        {"child_graph": {"human_inputs": ["Resume #2"]}},
+        {"cleanup": None},
+    )
+
+
+@pytest.mark.parametrize("checkpointer_name", ALL_CHECKPOINTERS_SYNC)
+def test_parallel_interrupts_double(
+    request: pytest.FixtureRequest, checkpointer_name: str
+) -> None:
+    from pydantic import BaseModel, Field
+
+    checkpointer = request.getfixturevalue(f"checkpointer_{checkpointer_name}")
+
+    # --- CHILD GRAPH ---
+
+    class ChildState(BaseModel):
+        prompt: str = Field(..., description="What is going to be asked to the user?")
+        human_input: Optional[str] = Field(None, description="What the human said")
+        human_inputs: Annotated[List[str], operator.add] = Field(
+            default_factory=list, description="All of my messages"
+        )
+
+    def get_human_input(state: ChildState):
+        human_input = interrupt(state.prompt)
+
+        return dict(
+            human_inputs=[human_input],  # update parent state
+        )
+
+    def get_dolphin_input(state: ChildState):
+        human_input = interrupt(state.prompt)
+
+        return dict(
+            human_inputs=[human_input],  # update parent state
+        )
+
+    child_graph_builder = StateGraph(ChildState)
+    child_graph_builder.add_node("get_human_input", get_human_input)
+    child_graph_builder.add_node("get_dolphin_input", get_dolphin_input)
+    child_graph_builder.add_edge(START, "get_human_input")
+    child_graph_builder.add_edge(START, "get_dolphin_input")
+    child_graph = child_graph_builder.compile()
+
+    # --- PARENT GRAPH ---
+
+    class ParentState(BaseModel):
+        prompts: List[str] = Field(
+            ..., description="What is going to be asked to the user?"
+        )
+        human_inputs: Annotated[List[str], operator.add] = Field(
+            default_factory=list, description="All of my messages"
+        )
+
+    def assign_workers(state: ParentState):
+        return [
+            Send(
+                "child_graph",
+                dict(
+                    prompt=prompt,
+                ),
+            )
+            for prompt in state.prompts
+        ]
+
+    def cleanup(state: ParentState):
+        assert len(state.human_inputs) == len(state.prompts) * 2
+
+    parent_graph_builder = StateGraph(ParentState)
+    parent_graph_builder.add_node("child_graph", child_graph)
+    parent_graph_builder.add_node("cleanup", cleanup)
+
+    parent_graph_builder.add_conditional_edges(START, assign_workers, ["child_graph"])
+    parent_graph_builder.add_edge("child_graph", "cleanup")
+    parent_graph_builder.add_edge("cleanup", END)
+
+    parent_graph = parent_graph_builder.compile(checkpointer=checkpointer)
+
+    # --- CLIENT INVOCATION ---
+
+    thread_config = dict(
+        configurable=dict(
+            thread_id=str(uuid.uuid4()),
+        )
+    )
+    current_input = dict(
+        prompts=["a", "b"],
+    )
+
+    invokes = 0
+    events: dict[int, list[dict]] = {}
+    while invokes < 10:
+        # reset interrupt
+        invokes += 1
+        events[invokes] = []
+        current_interrupts: list[Interrupt] = []
+
+        # start / resume the graph
+        for event in parent_graph.stream(
+            input=current_input,
+            config=thread_config,
+            stream_mode="updates",
+        ):
+            events[invokes].append(event)
+            # handle the interrupt
+            if "__interrupt__" in event:
+                current_interrupts.extend(event["__interrupt__"])
+                # assume that it breaks here, because it is an interrupt
+
+        # get human input and resume
+        if any(i.resumable for i in current_interrupts):
+            current_input = Command(resume=f"Resume #{invokes}")
+
+        # not more human input required, must be completed
+        else:
+            break
+    else:
+        assert False, "Detected infinite loop"
+
+    assert invokes == 5
+    assert len(events) == 5
+
+
+def test_pregel_loop_refcount():
+    gc.collect()
+    try:
+        gc.disable()
+
+        class State(TypedDict):
+            messages: Annotated[list, add_messages]
+
+        graph_builder = StateGraph(State)
+
+        def chatbot(state: State):
+            return {"messages": [("ai", "HIYA")]}
+
+        graph_builder.add_node("chatbot", chatbot)
+        graph_builder.set_entry_point("chatbot")
+        graph_builder.set_finish_point("chatbot")
+        graph = graph_builder.compile()
+
+        for _ in range(5):
+            graph.invoke({"messages": [{"role": "user", "content": "hi"}]})
+            assert (
+                len(
+                    [obj for obj in gc.get_objects() if isinstance(obj, SyncPregelLoop)]
+                )
+                == 0
+            )
+            assert (
+                len([obj for obj in gc.get_objects() if isinstance(obj, PregelRunner)])
+                == 0
+            )
+    finally:
+        gc.enable()
+
+
+@pytest.mark.parametrize("checkpointer_name", REGULAR_CHECKPOINTERS_SYNC)
+def test_bulk_state_updates(
+    request: pytest.FixtureRequest, checkpointer_name: str
+) -> None:
+    checkpointer = request.getfixturevalue(f"checkpointer_{checkpointer_name}")
+
+    class State(TypedDict):
+        foo: str
+        baz: str
+
+    def node_a(state: State) -> State:
+        return {"foo": "bar"}
+
+    def node_b(state: State) -> State:
+        return {"baz": "qux"}
+
+    graph = (
+        StateGraph(State)
+        .add_node("node_a", node_a)
+        .add_node("node_b", node_b)
+        .add_edge(START, "node_a")
+        .add_edge("node_a", "node_b")
+        .compile(checkpointer=checkpointer)
+    )
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    # First update with node_a
+    graph.bulk_update_state(
+        config,
+        [
+            [
+                StateUpdate(values={"foo": "bar"}, as_node="node_a"),
+            ]
+        ],
+    )
+
+    # Then bulk update with both nodes
+    graph.bulk_update_state(
+        config,
+        [
+            [
+                StateUpdate(values={"foo": "updated"}, as_node="node_a"),
+                StateUpdate(values={"baz": "new"}, as_node="node_b"),
+            ]
+        ],
+    )
+
+    state = graph.get_state(config)
+    assert state.values == {"foo": "updated", "baz": "new"}
+
+    # Check if there are only two checkpoints
+    checkpoints = list(checkpointer.list(config))
+    assert len(checkpoints) == 2
+    assert checkpoints[0].metadata["writes"] == {
+        "node_a": {"foo": "updated"},
+        "node_b": {"baz": "new"},
+    }
+    assert checkpoints[1].metadata["writes"] == {"node_a": {"foo": "bar"}}
+
+    # perform multiple steps at the same time
+    config = {"configurable": {"thread_id": "2"}}
+
+    graph.bulk_update_state(
+        config,
+        [
+            [
+                StateUpdate(values={"foo": "bar"}, as_node="node_a"),
+            ],
+            [
+                StateUpdate(values={"foo": "updated"}, as_node="node_a"),
+                StateUpdate(values={"baz": "new"}, as_node="node_b"),
+            ],
+        ],
+    )
+
+    state = graph.get_state(config)
+    assert state.values == {"foo": "updated", "baz": "new"}
+
+    checkpoints = list(checkpointer.list(config))
+    assert len(checkpoints) == 2
+    assert checkpoints[0].metadata["writes"] == {
+        "node_a": {"foo": "updated"},
+        "node_b": {"baz": "new"},
+    }
+    assert checkpoints[1].metadata["writes"] == {"node_a": {"foo": "bar"}}
+
+    # Should raise error if updating without as_node
+    with pytest.raises(InvalidUpdateError):
+        graph.bulk_update_state(
+            config,
+            [
+                [
+                    StateUpdate(values={"foo": "error"}, as_node=None),
+                    StateUpdate(values={"bar": "error"}, as_node=None),
+                ]
+            ],
+        )
+
+    # Should raise if no updates are provided
+    with pytest.raises(ValueError, match="No supersteps provided"):
+        graph.bulk_update_state(config, [])
+
+    # Should raise if no updates are provided
+    with pytest.raises(ValueError, match="No updates provided"):
+        graph.bulk_update_state(config, [[], []])
+
+    # Should raise if __end__ or __copy__ update is applied in bulk
+    with pytest.raises(InvalidUpdateError):
+        graph.bulk_update_state(
+            config,
+            [
+                [
+                    StateUpdate(values=None, as_node="__end__"),
+                    StateUpdate(values=None, as_node="__copy__"),
+                ],
+            ],
+        )
+
+
+@pytest.mark.parametrize("checkpointer_name", REGULAR_CHECKPOINTERS_SYNC)
+def test_update_as_input(
+    request: pytest.FixtureRequest, checkpointer_name: str
+) -> None:
+    checkpointer = request.getfixturevalue(f"checkpointer_{checkpointer_name}")
+
+    class State(TypedDict):
+        foo: str
+
+    def agent(state: State) -> State:
+        return {"foo": "agent"}
+
+    def tool(state: State) -> State:
+        return {"foo": "tool"}
+
+    graph = (
+        StateGraph(State)
+        .add_node("agent", agent)
+        .add_node("tool", tool)
+        .add_edge(START, "agent")
+        .add_edge("agent", "tool")
+        .compile(checkpointer=checkpointer)
+    )
+
+    assert graph.invoke({"foo": "input"}, {"configurable": {"thread_id": "1"}}) == {
+        "foo": "tool"
+    }
+
+    assert graph.invoke({"foo": "input"}, {"configurable": {"thread_id": "1"}}) == {
+        "foo": "tool"
+    }
+
+    def map_snapshot(i: StateSnapshot) -> dict:
+        return {
+            "values": i.values,
+            "next": i.next,
+            "step": i.metadata.get("step"),
+        }
+
+    history = [
+        map_snapshot(s)
+        for s in graph.get_state_history({"configurable": {"thread_id": "1"}})
+    ]
+
+    graph.bulk_update_state(
+        {"configurable": {"thread_id": "2"}},
+        [
+            # First turn
+            [StateUpdate({"foo": "input"}, "__input__")],
+            [StateUpdate({"foo": "input"}, "__start__")],
+            [StateUpdate({"foo": "agent"}, "agent")],
+            [StateUpdate({"foo": "tool"}, "tool")],
+            # Second turn
+            [StateUpdate({"foo": "input"}, "__input__")],
+            [StateUpdate({"foo": "input"}, "__start__")],
+            [StateUpdate({"foo": "agent"}, "agent")],
+            [StateUpdate({"foo": "tool"}, "tool")],
+        ],
+    )
+
+    state = graph.get_state({"configurable": {"thread_id": "2"}})
+    assert state.values == {"foo": "tool"}
+
+    new_history = [
+        map_snapshot(s)
+        for s in graph.get_state_history({"configurable": {"thread_id": "2"}})
+    ]
+
+    assert new_history == history
+
+
+@pytest.mark.parametrize("checkpointer_name", REGULAR_CHECKPOINTERS_SYNC)
+def test_batch_update_as_input(
+    request: pytest.FixtureRequest, checkpointer_name: str
+) -> None:
+    checkpointer = request.getfixturevalue(f"checkpointer_{checkpointer_name}")
+
+    class State(TypedDict):
+        foo: str
+        tasks: Annotated[list[int], operator.add]
+
+    def agent(state: State) -> State:
+        return {"foo": "agent"}
+
+    def map(state: State) -> Command["task"]:
+        return Command(
+            goto=[
+                Send("task", {"index": 0}),
+                Send("task", {"index": 1}),
+                Send("task", {"index": 2}),
+            ],
+            update={"foo": "map"},
+        )
+
+    def task(state: dict) -> State:
+        return {"tasks": [state["index"]]}
+
+    graph = (
+        StateGraph(State)
+        .add_node("agent", agent)
+        .add_node("map", map)
+        .add_node("task", task)
+        .add_edge(START, "agent")
+        .add_edge("agent", "map")
+        .compile(checkpointer=checkpointer)
+    )
+
+    assert graph.invoke({"foo": "input"}, {"configurable": {"thread_id": "1"}}) == {
+        "foo": "map",
+        "tasks": [0, 1, 2],
+    }
+
+    def map_snapshot(i: StateSnapshot) -> dict:
+        return {
+            "values": i.values,
+            "next": i.next,
+            "step": i.metadata.get("step"),
+            "tasks": [t.name for t in i.tasks],
+        }
+
+    history = [
+        map_snapshot(s)
+        for s in graph.get_state_history({"configurable": {"thread_id": "1"}})
+    ]
+
+    graph.bulk_update_state(
+        {"configurable": {"thread_id": "2"}},
+        [
+            [StateUpdate({"foo": "input"}, "__input__")],
+            [StateUpdate({"foo": "input"}, "__start__")],
+            [StateUpdate({"foo": "agent", "tasks": []}, "agent")],
+            [
+                StateUpdate(
+                    Command(
+                        goto=[
+                            Send("task", {"index": 0}),
+                            Send("task", {"index": 1}),
+                            Send("task", {"index": 2}),
+                        ],
+                        update={"foo": "map"},
+                    ),
+                    "map",
+                )
+            ],
+            [
+                StateUpdate({"tasks": [0]}, "task"),
+                StateUpdate({"tasks": [1]}, "task"),
+                StateUpdate({"tasks": [2]}, "task"),
+            ],
+        ],
+    )
+
+    state = graph.get_state({"configurable": {"thread_id": "2"}})
+    assert state.values == {"foo": "map", "tasks": [0, 1, 2]}
+
+    new_history = [
+        map_snapshot(s)
+        for s in graph.get_state_history({"configurable": {"thread_id": "2"}})
+    ]
+
+    assert new_history == history
