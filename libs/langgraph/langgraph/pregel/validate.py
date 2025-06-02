@@ -1,4 +1,5 @@
-from typing import Any, Mapping, Optional, Sequence, Union
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional, Union
 
 from langgraph.channels.base import BaseChannel
 from langgraph.constants import RESERVED
@@ -27,7 +28,7 @@ def validate_graph(
             subscribed_channels.update(node.triggers)
         else:
             raise TypeError(
-                f"Invalid node type {type(node)}, expected Channel.subscribe_to()"
+                f"Invalid node type {type(node)}, expected PregelNode or NodeBuilder"
             )
 
     for chan in subscribed_channels:

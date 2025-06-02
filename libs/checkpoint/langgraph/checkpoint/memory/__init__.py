@@ -7,7 +7,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, ExitStack
 from types import TracebackType
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from langchain_core.runnables import RunnableConfig
 
@@ -22,7 +22,6 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
     get_checkpoint_metadata,
 )
-from langgraph.checkpoint.serde.types import TASKS, ChannelProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +37,10 @@ class InMemorySaver(
         Only use `InMemorySaver` for debugging or testing purposes.
         For production use cases we recommend installing [langgraph-checkpoint-postgres](https://pypi.org/project/langgraph-checkpoint-postgres/) and using `PostgresSaver` / `AsyncPostgresSaver`.
 
+        If you are using the LangGraph Platform, no checkpointer needs to be specified. The correct managed checkpointer will be used automatically.
+
     Args:
-        serde (Optional[SerializerProtocol]): The serializer to use for serializing and deserializing checkpoints. Defaults to None.
+        serde: The serializer to use for serializing and deserializing checkpoints. Defaults to None.
 
     Examples:
 
@@ -66,9 +67,16 @@ class InMemorySaver(
             str, dict[str, tuple[tuple[str, bytes], tuple[str, bytes], Optional[str]]]
         ],
     ]
+    # (thread ID, checkpoint NS, checkpoint ID) -> (task ID, write idx)
     writes: defaultdict[
         tuple[str, str, str],
         dict[tuple[str, int], tuple[str, str, tuple[str, bytes], str]],
+    ]
+    blobs: dict[
+        tuple[
+            str, str, str, Union[str, int, float]
+        ],  # thread id, checkpoint ns, channel, version
+        tuple[str, bytes],
     ]
 
     def __init__(
@@ -80,10 +88,12 @@ class InMemorySaver(
         super().__init__(serde=serde)
         self.storage = factory(lambda: defaultdict(dict))
         self.writes = factory(dict)
+        self.blobs = factory()
         self.stack = ExitStack()
         if factory is not defaultdict:
             self.stack.enter_context(self.storage)  # type: ignore[arg-type]
             self.stack.enter_context(self.writes)  # type: ignore[arg-type]
+            self.stack.enter_context(self.blobs)  # type: ignore[arg-type]
 
     def __enter__(self) -> "InMemorySaver":
         return self.stack.__enter__()
@@ -107,6 +117,18 @@ class InMemorySaver(
     ) -> Optional[bool]:
         return self.stack.__exit__(__exc_type, __exc_value, __traceback)
 
+    def _load_blobs(
+        self, thread_id: str, checkpoint_ns: str, versions: ChannelVersions
+    ) -> dict[str, Any]:
+        channel_values: dict[str, Any] = {}
+        for k, v in versions.items():
+            kk = (thread_id, checkpoint_ns, k, v)
+            if kk in self.blobs:
+                vv = self.blobs[kk]
+                if vv[0] != "empty":
+                    channel_values[k] = self.serde.loads_typed(vv)
+        return channel_values
+
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """Get a checkpoint tuple from the in-memory storage.
 
@@ -116,35 +138,25 @@ class InMemorySaver(
         for the given thread ID is retrieved.
 
         Args:
-            config (RunnableConfig): The config to use for retrieving the checkpoint.
+            config: The config to use for retrieving the checkpoint.
 
         Returns:
             Optional[CheckpointTuple]: The retrieved checkpoint tuple, or None if no matching checkpoint was found.
         """
-        thread_id = config["configurable"]["thread_id"]
-        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        thread_id: str = config["configurable"]["thread_id"]
+        checkpoint_ns: str = config["configurable"].get("checkpoint_ns", "")
         if checkpoint_id := get_checkpoint_id(config):
             if saved := self.storage[thread_id][checkpoint_ns].get(checkpoint_id):
                 checkpoint, metadata, parent_checkpoint_id = saved
                 writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)].values()
-                if parent_checkpoint_id:
-                    sends = sorted(
-                        (
-                            (*w, k[1])
-                            for k, w in self.writes[
-                                (thread_id, checkpoint_ns, parent_checkpoint_id)
-                            ].items()
-                            if w[1] == TASKS
-                        ),
-                        key=lambda w: (w[3], w[0], w[4]),
-                    )
-                else:
-                    sends = []
+                checkpoint_: Checkpoint = self.serde.loads_typed(checkpoint)
                 return CheckpointTuple(
                     config=config,
                     checkpoint={
-                        **self.serde.loads_typed(checkpoint),
-                        "pending_sends": [self.serde.loads_typed(s[2]) for s in sends],
+                        **checkpoint_,
+                        "channel_values": self._load_blobs(
+                            thread_id, checkpoint_ns, checkpoint_["channel_versions"]
+                        ),
                     },
                     metadata=self.serde.loads_typed(metadata),
                     pending_writes=[
@@ -167,19 +179,7 @@ class InMemorySaver(
                 checkpoint_id = max(checkpoints.keys())
                 checkpoint, metadata, parent_checkpoint_id = checkpoints[checkpoint_id]
                 writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)].values()
-                if parent_checkpoint_id:
-                    sends = sorted(
-                        (
-                            (*w, k[1])
-                            for k, w in self.writes[
-                                (thread_id, checkpoint_ns, parent_checkpoint_id)
-                            ].items()
-                            if w[1] == TASKS
-                        ),
-                        key=lambda w: (w[3], w[0], w[4]),
-                    )
-                else:
-                    sends = []
+                checkpoint_ = self.serde.loads_typed(checkpoint)
                 return CheckpointTuple(
                     config={
                         "configurable": {
@@ -189,8 +189,10 @@ class InMemorySaver(
                         }
                     },
                     checkpoint={
-                        **self.serde.loads_typed(checkpoint),
-                        "pending_sends": [self.serde.loads_typed(s[2]) for s in sends],
+                        **checkpoint_,
+                        "channel_values": self._load_blobs(
+                            thread_id, checkpoint_ns, checkpoint_["channel_versions"]
+                        ),
                     },
                     metadata=self.serde.loads_typed(metadata),
                     pending_writes=[
@@ -223,10 +225,10 @@ class InMemorySaver(
         on the provided criteria.
 
         Args:
-            config (Optional[RunnableConfig]): Base configuration for filtering checkpoints.
-            filter (Optional[Dict[str, Any]]): Additional filtering criteria for metadata.
-            before (Optional[RunnableConfig]): List checkpoints created before this configuration.
-            limit (Optional[int]): Maximum number of checkpoints to return.
+            config: Base configuration for filtering checkpoints.
+            filter: Additional filtering criteria for metadata.
+            before: List checkpoints created before this configuration.
+            limit: Maximum number of checkpoints to return.
 
         Yields:
             Iterator[CheckpointTuple]: An iterator of matching checkpoint tuples.
@@ -283,19 +285,7 @@ class InMemorySaver(
                         (thread_id, checkpoint_ns, checkpoint_id)
                     ].values()
 
-                    if parent_checkpoint_id:
-                        sends = sorted(
-                            (
-                                (*w, k[1])
-                                for k, w in self.writes[
-                                    (thread_id, checkpoint_ns, parent_checkpoint_id)
-                                ].items()
-                                if w[1] == TASKS
-                            ),
-                            key=lambda w: (w[3], w[0], w[4]),
-                        )
-                    else:
-                        sends = []
+                    checkpoint_: Checkpoint = self.serde.loads_typed(checkpoint)
 
                     yield CheckpointTuple(
                         config={
@@ -306,10 +296,12 @@ class InMemorySaver(
                             }
                         },
                         checkpoint={
-                            **self.serde.loads_typed(checkpoint),
-                            "pending_sends": [
-                                self.serde.loads_typed(s[2]) for s in sends
-                            ],
+                            **checkpoint_,
+                            "channel_values": self._load_blobs(
+                                thread_id,
+                                checkpoint_ns,
+                                checkpoint_["channel_versions"],
+                            ),
                         },
                         metadata=metadata,
                         parent_config=(
@@ -341,18 +333,22 @@ class InMemorySaver(
         with the provided config.
 
         Args:
-            config (RunnableConfig): The config to associate with the checkpoint.
-            checkpoint (Checkpoint): The checkpoint to save.
-            metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
-            new_versions (dict): New versions as of this write
+            config: The config to associate with the checkpoint.
+            checkpoint: The checkpoint to save.
+            metadata: Additional metadata to save with the checkpoint.
+            new_versions: New versions as of this write
 
         Returns:
             RunnableConfig: The updated config containing the saved checkpoint's timestamp.
         """
         c = checkpoint.copy()
-        c.pop("pending_sends")  # type: ignore[misc]
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
+        values: dict[str, Any] = c.pop("channel_values")  # type: ignore[misc]
+        for k, v in new_versions.items():
+            self.blobs[(thread_id, checkpoint_ns, k, v)] = (
+                self.serde.dumps_typed(values[k]) if k in values else ("empty", b"")
+            )
         self.storage[thread_id][checkpoint_ns].update(
             {
                 checkpoint["id"]: (
@@ -383,10 +379,10 @@ class InMemorySaver(
         with the provided config.
 
         Args:
-            config (RunnableConfig): The config to associate with the writes.
-            writes (list[tuple[str, Any]]): The writes to save.
-            task_id (str): Identifier for the task creating the writes.
-            task_path (str): Path of the task creating the writes.
+            config: The config to associate with the writes.
+            writes: The writes to save.
+            task_id: Identifier for the task creating the writes.
+            task_path: Path of the task creating the writes.
 
         Returns:
             RunnableConfig: The updated config containing the saved writes' timestamp.
@@ -408,6 +404,24 @@ class InMemorySaver(
                 task_path,
             )
 
+    def delete_thread(self, thread_id: str) -> None:
+        """Delete all checkpoints and writes associated with a thread ID.
+
+        Args:
+            thread_id: The thread ID to delete.
+
+        Returns:
+            None
+        """
+        if thread_id in self.storage:
+            del self.storage[thread_id]
+        for k in list(self.writes.keys()):
+            if k[0] == thread_id:
+                del self.writes[k]
+        for k in list(self.blobs.keys()):
+            if k[0] == thread_id:
+                del self.blobs[k]
+
     async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """Asynchronous version of get_tuple.
 
@@ -415,7 +429,7 @@ class InMemorySaver(
         method in a separate thread using asyncio.
 
         Args:
-            config (RunnableConfig): The config to use for retrieving the checkpoint.
+            config: The config to use for retrieving the checkpoint.
 
         Returns:
             Optional[CheckpointTuple]: The retrieved checkpoint tuple, or None if no matching checkpoint was found.
@@ -436,7 +450,7 @@ class InMemorySaver(
         method in a separate thread using asyncio.
 
         Args:
-            config (RunnableConfig): The config to use for listing the checkpoints.
+            config: The config to use for listing the checkpoints.
 
         Yields:
             AsyncIterator[CheckpointTuple]: An asynchronous iterator of checkpoint tuples.
@@ -454,10 +468,10 @@ class InMemorySaver(
         """Asynchronous version of put.
 
         Args:
-            config (RunnableConfig): The config to associate with the checkpoint.
-            checkpoint (Checkpoint): The checkpoint to save.
-            metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
-            new_versions (dict): New versions as of this write
+            config: The config to associate with the checkpoint.
+            checkpoint: The checkpoint to save.
+            metadata: Additional metadata to save with the checkpoint.
+            new_versions: New versions as of this write
 
         Returns:
             RunnableConfig: The updated config containing the saved checkpoint's timestamp.
@@ -477,17 +491,28 @@ class InMemorySaver(
         method in a separate thread using asyncio.
 
         Args:
-            config (RunnableConfig): The config to associate with the writes.
-            writes (List[Tuple[str, Any]]): The writes to save, each as a (channel, value) pair.
-            task_id (str): Identifier for the task creating the writes.
-            task_path (str): Path of the task creating the writes.
+            config: The config to associate with the writes.
+            writes: The writes to save, each as a (channel, value) pair.
+            task_id: Identifier for the task creating the writes.
+            task_path: Path of the task creating the writes.
 
         Returns:
             None
         """
         return self.put_writes(config, writes, task_id, task_path)
 
-    def get_next_version(self, current: Optional[str], channel: ChannelProtocol) -> str:
+    async def adelete_thread(self, thread_id: str) -> None:
+        """Delete all checkpoints and writes associated with a thread ID.
+
+        Args:
+            thread_id: The thread ID to delete.
+
+        Returns:
+            None
+        """
+        return self.delete_thread(thread_id)
+
+    def get_next_version(self, current: Optional[str]) -> str:
         if current is None:
             current_v = 0
         elif isinstance(current, int):
@@ -572,4 +597,4 @@ class PersistentDict(defaultdict):
                 except Exception:
                     logging.error(f"Failed to load file: {fileobj.name}")
                     raise
-            raise ValueError("File not in a supported f ormat")
+            raise ValueError("File not in a supported format")

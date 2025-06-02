@@ -1,15 +1,12 @@
 from collections import defaultdict
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pprint import pformat
 from typing import (
     Any,
-    Iterable,
-    Iterator,
     Literal,
-    Mapping,
     Optional,
-    Sequence,
     Union,
 )
 from uuid import UUID
@@ -147,6 +144,19 @@ def map_debug_task_results(
     }
 
 
+def rm_pregel_keys(config: Optional[RunnableConfig]) -> Optional[RunnableConfig]:
+    """Remove pregel-specific keys from the config."""
+    if config is None:
+        return config
+    return {
+        "configurable": {
+            k: v
+            for k, v in config.get("configurable", {}).items()
+            if not k.startswith("__pregel_")
+        }
+    }
+
+
 def map_debug_checkpoint(
     step: int,
     config: RunnableConfig,
@@ -186,8 +196,10 @@ def map_debug_checkpoint(
         "timestamp": checkpoint["ts"],
         "step": step,
         "payload": {
-            "config": patch_checkpoint_map(config, metadata),
-            "parent_config": patch_checkpoint_map(parent_config, metadata),
+            "config": rm_pregel_keys(patch_checkpoint_map(config, metadata)),
+            "parent_config": rm_pregel_keys(
+                patch_checkpoint_map(parent_config, metadata)
+            ),
             "values": read_channels(channels, stream_channels),
             "metadata": metadata,
             "next": [t.name for t in tasks],
