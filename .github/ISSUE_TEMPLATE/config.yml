@@ -1,4 +1,4 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 version: 2.1
 contact_links:
   - name: 🤔 Question or Problem
@@ -10,6 +10,6 @@ contact_links:
   - name: Show and tell
     about: Show what you built with LangChain
     url: https://github.com/langchain-ai/langgraph/discussions/categories/show-and-tell
-  - name: Slack
-    url:  https://www.langchain.com/join-community
-    about: General community discussions
+  - name: LangChain Forum
+    url:  https://forum.langchain.com/
+    about: General community discussions and support

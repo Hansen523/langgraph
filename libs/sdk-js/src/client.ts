@@ -9,6 +9,7 @@ import {
   Cron,
   CronCreateForThreadResponse,
   CronCreateResponse,
+  CronSortBy,
   DefaultValues,
   GraphSchema,
   Item,
@@ -39,6 +40,75 @@ import { getEnvironmentVariable } from "./utils/env.js";
 import { mergeSignals } from "./utils/signals.js";
 import { BytesLineDecoder, SSEDecoder } from "./utils/sse.js";
 import { IterableReadableStream } from "./utils/stream.js";
+
+type HeaderValue = string | undefined | null;
+
+function* iterateHeaders(
+  headers: HeadersInit | Record<string, HeaderValue>,
+): IterableIterator<[string, string | null]> {
+  let iter: Iterable<(HeaderValue | HeaderValue | null[])[]>;
+  let shouldClear = false;
+
+  if (headers instanceof Headers) {
+    const entries: [string, string][] = [];
+    headers.forEach((value, name) => {
+      entries.push([name, value]);
+    });
+    iter = entries;
+  } else if (Array.isArray(headers)) {
+    iter = headers;
+  } else {
+    shouldClear = true;
+    iter = Object.entries(headers ?? {});
+  }
+
+  for (let item of iter) {
+    const name = item[0];
+    if (typeof name !== "string")
+      throw new TypeError(
+        `Expected header name to be a string, got ${typeof name}`,
+      );
+    const values = Array.isArray(item[1]) ? item[1] : [item[1]];
+    let didClear = false;
+
+    for (const value of values) {
+      if (value === undefined) continue;
+
+      // New object keys should always overwrite older headers
+      // Yield a null to clear the header in the headers object
+      // before adding the new value
+      if (shouldClear && !didClear) {
+        didClear = true;
+        yield [name, null];
+      }
+      yield [name, value];
+    }
+  }
+}
+
+function mergeHeaders(
+  ...headerObjects: (
+    | HeadersInit
+    | Record<string, HeaderValue>
+    | undefined
+    | null
+  )[]
+) {
+  const outputHeaders = new Headers();
+  for (const headers of headerObjects) {
+    if (!headers) continue;
+    for (const [name, value] of iterateHeaders(headers)) {
+      if (value === null) outputHeaders.delete(name);
+      else outputHeaders.append(name, value);
+    }
+  }
+  const headerEntries: [string, string][] = [];
+  outputHeaders.forEach((value, name) => {
+    headerEntries.push([name, value]);
+  });
+  return Object.fromEntries(headerEntries);
+}
+
 /**
  * Get the API key from the environment.
  * Precedence:
@@ -86,12 +156,18 @@ function getRunMetadataFromResponse(
   };
 }
 
+export type RequestHook = (
+  url: URL,
+  init: RequestInit,
+) => Promise<RequestInit> | RequestInit;
+
 export interface ClientConfig {
   apiUrl?: string;
   apiKey?: string;
   callerOptions?: AsyncCallerParams;
   timeoutMs?: number;
-  defaultHeaders?: Record<string, string | null | undefined>;
+  defaultHeaders?: Record<string, HeaderValue>;
+  onRequest?: RequestHook;
 }
 
 class BaseClient {
@@ -101,7 +177,9 @@ class BaseClient {
 
   protected apiUrl: string;
 
-  protected defaultHeaders: Record<string, string | null | undefined>;
+  protected defaultHeaders: Record<string, HeaderValue>;
+
+  protected onRequest?: RequestHook;
 
   constructor(config?: ClientConfig) {
     const callerOptions = {
@@ -136,9 +214,10 @@ class BaseClient {
     // Regex to remove trailing slash, if present
     this.apiUrl = config?.apiUrl?.replace(/\/$/, "") || defaultApiUrl;
     this.defaultHeaders = config?.defaultHeaders || {};
+    this.onRequest = config?.onRequest;
     const apiKey = getApiKey(config?.apiKey);
     if (apiKey) {
-      this.defaultHeaders["X-Api-Key"] = apiKey;
+      this.defaultHeaders["x-api-key"] = apiKey;
     }
   }
 
@@ -153,15 +232,14 @@ class BaseClient {
   ): [url: URL, init: RequestInit] {
     const mutatedOptions = {
       ...options,
-      headers: { ...this.defaultHeaders, ...options?.headers },
+      headers: mergeHeaders(this.defaultHeaders, options?.headers),
     };
 
     if (mutatedOptions.json) {
       mutatedOptions.body = JSON.stringify(mutatedOptions.json);
-      mutatedOptions.headers = {
-        ...mutatedOptions.headers,
-        "Content-Type": "application/json",
-      };
+      mutatedOptions.headers = mergeHeaders(mutatedOptions.headers, {
+        "content-type": "application/json",
+      });
       delete mutatedOptions.json;
     }
 
@@ -230,9 +308,14 @@ class BaseClient {
       withResponse?: boolean;
     },
   ): Promise<T | [T, Response]> {
-    const response = await this.asyncCaller.fetch(
-      ...this.prepareFetchOptions(path, options),
-    );
+    const [url, init] = this.prepareFetchOptions(path, options);
+
+    let finalInit = init;
+    if (this.onRequest) {
+      finalInit = await this.onRequest(url, init);
+    }
+
+    const response = await this.asyncCaller.fetch(url, finalInit);
 
     const body = (() => {
       if (response.status === 202 || response.status === 204) {
@@ -333,6 +416,8 @@ export class CronsClient extends BaseClient {
     threadId?: string;
     limit?: number;
     offset?: number;
+    sortBy?: CronSortBy;
+    sortOrder?: SortOrder;
   }): Promise<Cron[]> {
     return this.fetch<Cron[]>("/runs/crons/search", {
       method: "POST",
@@ -341,6 +426,8 @@ export class CronsClient extends BaseClient {
         thread_id: query?.threadId ?? undefined,
         limit: query?.limit ?? 10,
         offset: query?.offset ?? 0,
+        sort_by: query?.sortBy ?? undefined,
+        sort_order: query?.sortOrder ?? undefined,
       },
     });
   }
@@ -679,7 +766,6 @@ export class ThreadsClient<
     offset?: number;
     /**
      * Thread status to filter on.
-     * Must be one of 'idle', 'busy', 'interrupted' or 'error'.
      */
     status?: ThreadStatus;
     /**
@@ -928,8 +1014,8 @@ export class RunsClient<
     const stream: ReadableStream<{ event: any; data: any }> = (
       response.body || new ReadableStream({ start: (ctrl) => ctrl.close() })
     )
-      .pipeThrough(new BytesLineDecoder())
-      .pipeThrough(new SSEDecoder());
+      .pipeThrough(BytesLineDecoder())
+      .pipeThrough(SSEDecoder());
 
     yield* IterableReadableStream.fromReadableStream(stream);
   }
@@ -965,6 +1051,12 @@ export class RunsClient<
       after_seconds: payload?.afterSeconds,
       if_not_exists: payload?.ifNotExists,
       checkpoint_during: payload?.checkpointDuring,
+      langsmith_tracer: payload?._langsmithTracer
+        ? {
+            project_name: payload?._langsmithTracer?.projectName,
+            example_id: payload?._langsmithTracer?.exampleId,
+          }
+        : undefined,
     };
 
     const [run, response] = await this.fetch<Run>(`/threads/${threadId}/runs`, {
@@ -1045,6 +1137,12 @@ export class RunsClient<
       after_seconds: payload?.afterSeconds,
       if_not_exists: payload?.ifNotExists,
       checkpoint_during: payload?.checkpointDuring,
+      langsmith_tracer: payload?._langsmithTracer
+        ? {
+            project_name: payload?._langsmithTracer?.projectName,
+            example_id: payload?._langsmithTracer?.exampleId,
+          }
+        : undefined,
     };
     const endpoint =
       threadId == null ? `/runs/wait` : `/threads/${threadId}/runs/wait`;
@@ -1220,8 +1318,8 @@ export class RunsClient<
     const stream: ReadableStream<{ event: string; data: any }> = (
       response.body || new ReadableStream({ start: (ctrl) => ctrl.close() })
     )
-      .pipeThrough(new BytesLineDecoder())
-      .pipeThrough(new SSEDecoder());
+      .pipeThrough(BytesLineDecoder())
+      .pipeThrough(SSEDecoder());
 
     yield* IterableReadableStream.fromReadableStream(stream);
   }
@@ -1560,7 +1658,30 @@ export class Client<
    */
   public "~ui": UiClient;
 
+  /**
+   * @internal Used to obtain a stable key representing the client.
+   */
+  private "~configHash": string | undefined;
+
   constructor(config?: ClientConfig) {
+    this["~configHash"] = (() =>
+      JSON.stringify({
+        apiUrl: config?.apiUrl,
+        apiKey: config?.apiKey,
+        timeoutMs: config?.timeoutMs,
+        defaultHeaders: config?.defaultHeaders,
+
+        maxConcurrency: config?.callerOptions?.maxConcurrency,
+        maxRetries: config?.callerOptions?.maxRetries,
+
+        callbacks: {
+          onFailedResponseHook:
+            config?.callerOptions?.onFailedResponseHook != null,
+          onRequest: config?.onRequest != null,
+          fetch: config?.callerOptions?.fetch != null,
+        },
+      }))();
+
     this.assistants = new AssistantsClient(config);
     this.threads = new ThreadsClient(config);
     this.runs = new RunsClient(config);
@@ -1568,4 +1689,11 @@ export class Client<
     this.store = new StoreClient(config);
     this["~ui"] = new UiClient(config);
   }
+}
+
+/**
+ * @internal Used to obtain a stable key representing the client.
+ */
+export function getClientConfigHash(client: Client): string | undefined {
+  return client["~configHash"];
 }

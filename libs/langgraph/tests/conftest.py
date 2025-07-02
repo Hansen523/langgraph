@@ -1,3 +1,4 @@
+import os
 from collections.abc import AsyncIterator, Iterator
 from uuid import UUID
 
@@ -11,6 +12,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.store.base import BaseStore
 from tests.conftest_checkpointer import (
     _checkpointer_memory,
+    _checkpointer_memory_migrate_sends,
     _checkpointer_postgres,
     _checkpointer_postgres_aio,
     _checkpointer_postgres_aio_pipe,
@@ -30,6 +32,8 @@ from tests.conftest_store import (
     _store_postgres_pipe,
     _store_postgres_pool,
 )
+
+NO_DOCKER = os.getenv("NO_DOCKER", "false") == "true"
 
 
 @pytest.fixture
@@ -62,7 +66,9 @@ def cache(request: pytest.FixtureRequest) -> Iterator[BaseCache]:
 
 @pytest.fixture(
     scope="function",
-    params=["in_memory", "postgres", "postgres_pipe", "postgres_pool"],
+    params=["in_memory"]
+    if NO_DOCKER
+    else ["in_memory", "postgres", "postgres_pipe", "postgres_pool"],
 )
 def sync_store(request: pytest.FixtureRequest) -> Iterator[BaseStore]:
     store_name = request.param
@@ -86,7 +92,9 @@ def sync_store(request: pytest.FixtureRequest) -> Iterator[BaseStore]:
 
 @pytest.fixture(
     scope="function",
-    params=["in_memory", "postgres_aio", "postgres_aio_pipe", "postgres_aio_pool"],
+    params=["in_memory"]
+    if NO_DOCKER
+    else ["in_memory", "postgres_aio", "postgres_aio_pipe", "postgres_aio_pool"],
 )
 async def async_store(request: pytest.FixtureRequest) -> AsyncIterator[BaseStore]:
     store_name = request.param
@@ -114,6 +122,13 @@ async def async_store(request: pytest.FixtureRequest) -> AsyncIterator[BaseStore
         "memory",
         "sqlite",
         "sqlite_aes",
+    ]
+    if NO_DOCKER
+    else [
+        "memory",
+        "memory_migrate_sends",
+        "sqlite",
+        "sqlite_aes",
         "postgres",
         "postgres_pipe",
         "postgres_pool",
@@ -125,6 +140,9 @@ def sync_checkpointer(
     checkpointer_name = request.param
     if checkpointer_name == "memory":
         with _checkpointer_memory() as checkpointer:
+            yield checkpointer
+    elif checkpointer_name == "memory_migrate_sends":
+        with _checkpointer_memory_migrate_sends() as checkpointer:
             yield checkpointer
     elif checkpointer_name == "sqlite":
         with _checkpointer_sqlite() as checkpointer:
@@ -148,6 +166,11 @@ def sync_checkpointer(
 @pytest.fixture(
     scope="function",
     params=[
+        "memory",
+        "sqlite_aio",
+    ]
+    if NO_DOCKER
+    else [
         "memory",
         "sqlite_aio",
         "postgres_aio",

@@ -13,16 +13,22 @@ type MessageContent = string | MessageContentComplex[];
  */
 type MessageAdditionalKwargs = Record<string, unknown>;
 
-export type HumanMessage = {
-  type: "human";
-  id?: string | undefined;
+type BaseMessage = {
+  additional_kwargs?: MessageAdditionalKwargs | undefined;
   content: MessageContent;
+  id?: string | undefined;
+  name?: string | undefined;
+  response_metadata?: Record<string, unknown> | undefined;
 };
 
-export type AIMessage = {
+export type HumanMessage = BaseMessage & {
+  type: "human";
+  example?: boolean | undefined;
+};
+
+export type AIMessage = BaseMessage & {
   type: "ai";
-  id?: string | undefined;
-  content: MessageContent;
+  example?: boolean | undefined;
   tool_calls?:
     | {
         name: string;
@@ -57,37 +63,33 @@ export type AIMessage = {
           | undefined;
       }
     | undefined;
-  additional_kwargs?: MessageAdditionalKwargs | undefined;
-  response_metadata?: Record<string, unknown> | undefined;
 };
 
-export type ToolMessage = {
+export type ToolMessage = BaseMessage & {
   type: "tool";
-  name?: string | undefined;
-  id?: string | undefined;
-  content: MessageContent;
   status?: "error" | "success" | undefined;
   tool_call_id: string;
-  additional_kwargs?: MessageAdditionalKwargs | undefined;
-  response_metadata?: Record<string, unknown> | undefined;
+  /**
+   * Artifact of the Tool execution which is not meant to be sent to the model.
+   *
+   * Should only be specified if it is different from the message content, e.g. if only
+   * a subset of the full tool output is being passed as message content but the full
+   * output is needed in other parts of the code.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  artifact?: any;
 };
 
-export type SystemMessage = {
+export type SystemMessage = BaseMessage & {
   type: "system";
-  id?: string | undefined;
-  content: MessageContent;
 };
 
-export type FunctionMessage = {
+export type FunctionMessage = BaseMessage & {
   type: "function";
-  id?: string | undefined;
-  content: MessageContent;
 };
 
-export type RemoveMessage = {
+export type RemoveMessage = BaseMessage & {
   type: "remove";
-  id: string;
-  content: MessageContent;
 };
 
 export type Message =

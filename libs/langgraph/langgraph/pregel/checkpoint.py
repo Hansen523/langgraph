@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Optional, Union
 
 from langgraph.channels.base import BaseChannel
 from langgraph.checkpoint.base import Checkpoint
@@ -24,10 +25,10 @@ def empty_checkpoint() -> Checkpoint:
 
 def create_checkpoint(
     checkpoint: Checkpoint,
-    channels: Optional[Mapping[str, BaseChannel]],
+    channels: Mapping[str, BaseChannel] | None,
     step: int,
     *,
-    id: Optional[str] = None,
+    id: str | None = None,
 ) -> Checkpoint:
     """Create a checkpoint for the given channels."""
     ts = datetime.now(timezone.utc).isoformat()
@@ -52,7 +53,7 @@ def create_checkpoint(
 
 
 def channels_from_checkpoint(
-    specs: Mapping[str, Union[BaseChannel, ManagedValueSpec]],
+    specs: Mapping[str, BaseChannel | ManagedValueSpec],
     checkpoint: Checkpoint,
 ) -> tuple[Mapping[str, BaseChannel], ManagedValueMapping]:
     """Get channels from a checkpoint."""
@@ -69,4 +70,15 @@ def channels_from_checkpoint(
             for k, v in channel_specs.items()
         },
         managed_specs,
+    )
+
+
+def copy_checkpoint(checkpoint: Checkpoint) -> Checkpoint:
+    return Checkpoint(
+        v=checkpoint["v"],
+        ts=checkpoint["ts"],
+        id=checkpoint["id"],
+        channel_values=checkpoint["channel_values"].copy(),
+        channel_versions=checkpoint["channel_versions"].copy(),
+        versions_seen={k: v.copy() for k, v in checkpoint["versions_seen"].items()},
     )

@@ -30,7 +30,10 @@ from langchain_core.runnables.config import (
 )
 from langchain_core.tools import BaseTool, InjectedToolArg
 from langchain_core.tools import tool as create_tool
-from langchain_core.tools.base import get_all_basemodel_annotations
+from langchain_core.tools.base import (
+    TOOL_MESSAGE_BLOCK_TYPES,
+    get_all_basemodel_annotations,
+)
 from pydantic import BaseModel
 from typing_extensions import Annotated, get_args, get_origin
 
@@ -46,12 +49,11 @@ TOOL_CALL_ERROR_TEMPLATE = "Error: {error}\n Please fix your mistakes."
 
 
 def msg_content_output(output: Any) -> Union[str, list[dict]]:
-    recognized_content_block_types = ("image", "image_url", "text", "json")
     if isinstance(output, str):
         return output
     elif isinstance(output, list) and all(
         [
-            isinstance(x, dict) and x.get("type") in recognized_content_block_types
+            isinstance(x, dict) and x.get("type") in TOOL_MESSAGE_BLOCK_TYPES
             for x in output
         ]
     ):
@@ -629,7 +631,7 @@ def tools_condition(
 
     Args:
         state: The state to check for
-            tool calls. Must have a list of messages or have the
+            tool calls. Must have a list of messages (MessageGraph) or have the
             "messages" key (StateGraph).
 
     Returns:
@@ -850,7 +852,7 @@ def _get_store_arg(tool: BaseTool) -> Optional[str]:
             if _is_injection(type_arg, InjectedStore)
         ]
         if len(injections) > 1:
-            ValueError(
+            raise ValueError(
                 "A tool argument should not be annotated with InjectedStore more than "
                 f"once. Received arg {name} with annotations {injections}."
             )
